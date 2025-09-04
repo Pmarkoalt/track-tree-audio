@@ -8,15 +8,17 @@ from datetime import datetime
 class SplitRequest(BaseModel):
     """Request model for /split endpoint."""
     version_id: str = Field(..., description="Unique version identifier")
-    audio_url: str = Field(..., description="Pre-signed URL to download audio")
-    ai_model: str = Field(..., description="Demucs model to use (e.g., 'htdemucs')")
-    webhook: str = Field(..., description="Webhook URL to call on completion")
+    file_key: str = Field(..., description="S3/R2 object key for the audio file")
+    stem_types: list[str] = Field(..., description="List of stem types to extract")
+    callback_url: str = Field(..., description="Webhook URL to call on completion")
     correlation_id: Optional[str] = Field(None, description="Optional correlation ID for tracking")
 
 
 class SplitResponse(BaseModel):
     """Response model for /split endpoint."""
     job_id: str = Field(..., description="Unique job identifier")
+    status: str = Field(default="accepted", description="Job status")
+    message: Optional[str] = Field(None, description="Status message")
 
 
 class StemInfo(BaseModel):
@@ -31,11 +33,11 @@ class StemInfo(BaseModel):
 
 class WebhookPayload(BaseModel):
     """Payload sent to webhook on job completion."""
-    version_id: str = Field(..., description="Original version ID")
+    job_id: str = Field(..., description="Job identifier")
     status: Literal["completed", "failed"] = Field(..., description="Job status")
-    processing_time_ms: int = Field(..., description="Processing time in milliseconds")
     stems: List[StemInfo] = Field(default_factory=list, description="Generated stems")
     error: Optional[str] = Field(None, description="Error message if failed")
+    processing_time: Optional[int] = Field(None, description="Processing time in milliseconds")
 
 
 class HealthResponse(BaseModel):

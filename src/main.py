@@ -10,6 +10,7 @@ from .models import SplitRequest, SplitResponse, HealthResponse, QueueStatusResp
 from .security import verify_hmac_signature, is_webhook_url_allowed
 from .queues import celery_app
 from .demucs_runner import process_audio_split
+from .mock_demucs_runner import mock_process_audio_split
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -87,21 +88,36 @@ async def split_audio(
             raise HTTPException(status_code=401, detail="Invalid HMAC signature")
         
         # Validate webhook URL
-        if not is_webhook_url_allowed(request.webhook):
+        if not is_webhook_url_allowed(request.callback_url):
             raise HTTPException(status_code=400, detail="Webhook URL not allowed")
         
-        # Enqueue the job
-        job = process_audio_split.delay(
-            version_id=request.version_id,
-            audio_url=request.audio_url,
-            ai_model=request.ai_model,
-            webhook=request.webhook,
-            correlation_id=request.correlation_id
-        )
+        # For development, use mock implementation
+        # In production, this would use the real Demucs processing
+        if settings.demucssvc_token == "mock-token-for-development":
+            # Use mock implementation for development
+            import asyncio
+            result = asyncio.run(mock_process_audio_split(
+                version_id=request.version_id,
+                file_key=request.file_key,
+                stem_types=request.stem_types,
+                callback_url=request.callback_url,
+                correlation_id=request.correlation_id
+            ))
+            job_id = result["job_id"]
+        else:
+            # Use real Demucs processing
+            job = process_audio_split.delay(
+                version_id=request.version_id,
+                file_key=request.file_key,
+                stem_types=request.stem_types,
+                callback_url=request.callback_url,
+                correlation_id=request.correlation_id
+            )
+            job_id = job.id
         
-        logger.info(f"Enqueued job {job.id} for version {request.version_id}")
+        logger.info(f"Enqueued job {job_id} for version {request.version_id}")
         
-        return SplitResponse(job_id=job.id)
+        return SplitResponse(job_id=job_id)
         
     except HTTPException:
         raise

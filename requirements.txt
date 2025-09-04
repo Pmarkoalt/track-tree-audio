@@ -1,15 +1,25 @@
-fastapi>=0.100.0
-uvicorn[standard]>=0.20.0
-pydantic>=2.0.0
-pydantic-settings>=2.0.0
-celery>=5.3.0
-redis>=4.0.0
-boto3>=1.26.0
-requests>=2.28.0
-demucs>=4.0.0
-torch>=2.0.0
-torchaudio>=2.0.0
-ffmpeg-python>=0.2.0
-python-multipart>=0.0.5
-python-jose[cryptography]>=3.3.0
-cryptography>=40.0.0
+# Track Tree Audio Service Dependencies
+
+# Web Framework
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+
+# Data Validation
+pydantic==2.5.0
+pydantic-settings==2.1.0
+
+# HTTP Client
+httpx==0.25.2
+
+# Task Queue (for production)
+celery==5.3.4
+redis==5.0.1
+
+# Audio Processing (for production)
+# torch==2.1.0
+# torchaudio==2.1.0
+# demucs==4.0.0
+
+# Development
+pytest==7.4.3
+pytest-asyncio==0.21.1
