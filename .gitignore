@@ -73,5 +73,7 @@ models/
 *.pth
 *.pt
 
-# Docker
-.dockerignore
+# Docker build exclusions are source-controlled.
+
+# Separate inference and core-audit environments remain local.
+.venv*/

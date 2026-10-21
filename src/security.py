@@ -1,113 +1,75 @@
-"""HMAC security utilities for request authentication and webhook signing."""
+"""Exact raw-byte timestamp.body HMAC shared with the TypeScript bridge."""
 
-import hmac
 import hashlib
+import hmac
+import re
 import time
-from typing import Optional
-from urllib.parse import urlparse
-
+from urllib.parse import urlsplit
 from .env import settings
 
 
-def verify_hmac_signature(payload: str, signature: str, timestamp: Optional[str] = None) -> bool:
-    """
-    Verify HMAC signature for incoming requests.
-    
-    Args:
-        payload: The request body as string
-        signature: The X-Signature header value (format: sha256=<hex>)
-        timestamp: Optional timestamp for replay attack prevention
-        
-    Returns:
-        True if signature is valid, False otherwise
-    """
-    if not signature.startswith("sha256="):
-        return False
-    
-    # Extract the hex signature
-    received_signature = signature[7:]  # Remove "sha256=" prefix
-    
-    # Create expected signature
-    expected_signature = create_hmac_signature(payload, timestamp)
-    
-    # Use constant-time comparison to prevent timing attacks
-    return hmac.compare_digest(received_signature, expected_signature)
-
-
-def create_hmac_signature(payload: str, timestamp: Optional[str] = None) -> str:
-    """
-    Create HMAC signature for outgoing webhooks.
-    
-    Args:
-        payload: The payload to sign
-        timestamp: Optional timestamp to include in signature
-        
-    Returns:
-        Hex-encoded HMAC signature
-    """
-    # Include timestamp in payload to prevent replay attacks
-    if timestamp is None:
-        timestamp = str(int(time.time()))
-    
-    # Create message to sign (payload + timestamp)
-    message = f"{payload}|{timestamp}"
-    
-    # Create HMAC signature
-    signature = hmac.new(
-        settings.demucssvc_token.encode('utf-8'),
-        message.encode('utf-8'),
-        hashlib.sha256
+def create_hmac_signature(
+    payload: str | bytes, timestamp: str, secret: str | None = None
+) -> str:
+    body = payload.encode("utf-8") if isinstance(payload, str) else payload
+    return hmac.new(
+        (secret if secret is not None else settings.demucssvc_token).encode(),
+        timestamp.encode("ascii") + b"." + body,
+        hashlib.sha256,
     ).hexdigest()
-    
-    return signature
 
 
-def is_webhook_url_allowed(webhook_url: str) -> bool:
-    """
-    Check if webhook URL is in the allowlist.
-    
-    Args:
-        webhook_url: The webhook URL to validate
-        
-    Returns:
-        True if URL is allowed, False otherwise
-    """
-    try:
-        parsed_url = urlparse(webhook_url)
-        if not parsed_url.scheme or not parsed_url.netloc:
-            return False
-        
-        # Check against allowlist
-        for allowed_url in settings.api_webhook_url_allowlist:
-            allowed_parsed = urlparse(allowed_url)
-            if (parsed_url.scheme == allowed_parsed.scheme and 
-                parsed_url.netloc == allowed_parsed.netloc and
-                parsed_url.path.startswith(allowed_parsed.path)):
-                return True
-        
+def verify_hmac_signature(
+    payload: str | bytes,
+    signature: str,
+    timestamp: str,
+    *,
+    secret: str | None = None,
+    now: float | None = None,
+) -> bool:
+    token = secret if secret is not None else settings.demucssvc_token
+    if (
+        not token
+        or not re.fullmatch(r"\d{10}", timestamp or "")
+        or not re.fullmatch(r"sha256=[0-9a-f]{64}", signature or "")
+    ):
         return False
-    except Exception:
+    if abs((time.time() if now is None else now) - int(timestamp)) > 300:
         return False
+    return hmac.compare_digest(
+        signature[7:], create_hmac_signature(payload, timestamp, token)
+    )
 
 
-def get_webhook_headers(payload: str, timestamp: Optional[str] = None) -> dict:
-    """
-    Get headers for webhook requests including HMAC signature.
-    
-    Args:
-        payload: The webhook payload
-        timestamp: Optional timestamp
-        
-    Returns:
-        Dictionary of headers including X-Signature
-    """
-    if timestamp is None:
-        timestamp = str(int(time.time()))
-    
-    signature = create_hmac_signature(payload, timestamp)
-    
+def get_webhook_headers(
+    payload: str | bytes, timestamp: str | None = None
+) -> dict[str, str]:
+    timestamp = timestamp or str(int(time.time()))
     return {
-        "X-Signature": f"sha256={signature}",
+        "Content-Type": "application/json",
         "X-Timestamp": timestamp,
-        "Content-Type": "application/json"
+        "X-Signature": "sha256=" + create_hmac_signature(payload, timestamp),
     }
+
+
+def is_webhook_url_allowed(url: str) -> bool:
+    value = urlsplit(url)
+    return (
+        value.scheme in ("http", "https")
+        and not value.username
+        and not value.password
+        and not value.query
+        and not value.fragment
+        and url in settings.api_webhook_url_allowlist
+    )
+
+
+def is_media_url_allowed(url: str) -> bool:
+    value = urlsplit(url)
+    return (
+        value.scheme in ("http", "https")
+        and not value.username
+        and not value.password
+        and not value.fragment
+        and f"{value.scheme}://{value.netloc}" in settings.media_url_origins
+    )

@@ -1,306 +1,368 @@
-"""Demucs audio separation task implementation."""
+"""Actual Demucs inference, immutable callback payload, and independent delivery retries."""
 
+import hashlib
+import json
 import os
+from pathlib import Path
+import signal
+import subprocess
 import sys
 import tempfile
+import threading
 import time
-import logging
-import hashlib
-import subprocess
-from typing import List, Dict, Any
-from pathlib import Path
-
-# Add user site-packages to path for demucs
-sys.path.append('/Users/pmarko.alt/Library/Python/3.9/lib/python/site-packages')
-
+import wave
+from urllib.parse import urlsplit, urlunsplit
 import requests
-import torch
-from celery import current_task
-from demucs import separate
-from demucs import pretrained
-
-from .models import StemInfo, WebhookPayload
-from .security import get_webhook_headers
-from .s3 import upload_to_s3
+from .env import settings
+from .models import SplitRequest, WebhookPayload
+from .security import get_webhook_headers, is_media_url_allowed, is_webhook_url_allowed
 from .queues import celery_app
+from . import state
 
-logger = logging.getLogger(__name__)
+
+class JobCanceled(Exception):
+    pass
 
 
-@celery_app.task(bind=True, name="src.demucs_runner.process_audio_split")
-def process_audio_split(
-    self,
-    version_id: str,
-    audio_url: str,
-    ai_model: str,
-    webhook: str,
-    correlation_id: str = None
-) -> Dict[str, Any]:
-    """
-    Process audio separation using Demucs.
-    
-    Args:
-        version_id: Unique version identifier
-        audio_url: Pre-signed URL to download audio
-        ai_model: Demucs model name
-        webhook: Webhook URL to call on completion
-        correlation_id: Optional correlation ID
-        
-    Returns:
-        Dictionary with job results
-    """
-    start_time = time.time()
-    temp_dir = None
-    
-    try:
-        # Update task state
-        self.update_state(state="PROGRESS", meta={"status": "Starting audio separation"})
-        
-        # Create temporary directory
-        temp_dir = tempfile.mkdtemp(prefix="demucs_")
-        logger.info(f"Created temp directory: {temp_dir}")
-        
-        # Download audio file
-        self.update_state(state="PROGRESS", meta={"status": "Downloading audio"})
-        audio_path = download_audio(audio_url, temp_dir)
-        
-        # Load Demucs model
-        self.update_state(state="PROGRESS", meta={"status": "Loading model"})
-        model = load_demucs_model(ai_model)
-        
-        # Separate audio
-        self.update_state(state="PROGRESS", meta={"status": "Separating audio"})
-        stems = separate_audio(model, audio_path, temp_dir)
-        
-        # Upload stems to S3
-        self.update_state(state="PROGRESS", meta={"status": "Uploading stems"})
-        stem_infos = upload_stems(stems, version_id)
-        
-        # Calculate processing time
-        processing_time_ms = int((time.time() - start_time) * 1000)
-        
-        # Create webhook payload
-        payload = WebhookPayload(
-            version_id=version_id,
-            status="completed",
-            processing_time_ms=processing_time_ms,
-            stems=stem_infos,
-            error=None
+def refresh(request: SplitRequest) -> dict:
+    if not is_webhook_url_allowed(request.callbackUrl):
+        raise ValueError("Callback destination is not approved")
+    callback = urlsplit(request.callbackUrl)
+    url = urlunsplit(
+        (
+            callback.scheme,
+            callback.netloc,
+            f"/internal/audio/jobs/{request.jobId}/urls",
+            "",
+            "",
         )
-        
-        # Send webhook
-        self.update_state(state="PROGRESS", meta={"status": "Sending webhook"})
-        send_webhook(webhook, payload)
-        
-        logger.info(f"Successfully processed version {version_id} in {processing_time_ms}ms")
-        
-        return {
-            "status": "completed",
-            "version_id": version_id,
-            "processing_time_ms": processing_time_ms,
-            "stems_count": len(stem_infos)
-        }
-        
-    except Exception as e:
-        processing_time_ms = int((time.time() - start_time) * 1000)
-        error_msg = str(e)
-        
-        logger.error(f"Error processing version {version_id}: {error_msg}")
-        
-        # Send error webhook
-        try:
-            payload = WebhookPayload(
-                version_id=version_id,
-                status="failed",
-                processing_time_ms=processing_time_ms,
-                stems=[],
-                error=error_msg
-            )
-            send_webhook(webhook, payload)
-        except Exception as webhook_error:
-            logger.error(f"Failed to send error webhook: {webhook_error}")
-        
-        # Update task state with error
-        self.update_state(
-            state="FAILURE",
-            meta={"error": error_msg, "processing_time_ms": processing_time_ms}
-        )
-        
-        raise
-        
-    finally:
-        # Cleanup temporary files
-        if temp_dir and os.path.exists(temp_dir):
-            import shutil
-            shutil.rmtree(temp_dir)
-            logger.info(f"Cleaned up temp directory: {temp_dir}")
+    )
+    body = b"{}"
+    response = requests.post(
+        url,
+        data=body,
+        headers=get_webhook_headers(body),
+        timeout=15,
+        allow_redirects=False,
+    )
+    if response.status_code in (404, 409):
+        raise JobCanceled()
+    response.raise_for_status()
+    if response.status_code != 200:
+        raise RuntimeError("Unexpected refresh response")
+    value = response.json()
+    if value.get("jobId") != str(request.jobId):
+        raise ValueError("Refresh job binding failed")
+    if not is_media_url_allowed(value.get("audioUrl", "")):
+        raise ValueError("Source destination is not approved")
+    expected = {(output.type, output.fileKey) for output in request.outputs}
+    actual = {
+        (output.get("type"), output.get("fileKey"))
+        for output in value.get("outputs", [])
+    }
+    if actual != expected or any(
+        not is_media_url_allowed(o.get("uploadUrl", ""))
+        for o in value.get("outputs", [])
+    ):
+        raise ValueError("Output grant binding failed")
+    return value
 
 
-def download_audio(audio_url: str, temp_dir: str) -> str:
-    """Download audio file from URL to temporary directory."""
-    try:
-        response = requests.get(audio_url, stream=True, timeout=300)
+def download_audio(url: str, path: Path):
+    if not is_media_url_allowed(url):
+        raise ValueError("Source destination is not approved")
+    with requests.get(
+        url, stream=True, timeout=(5, 60), allow_redirects=False
+    ) as response:
         response.raise_for_status()
-        
-        # Determine file extension from content type or URL
-        content_type = response.headers.get('content-type', '')
-        if 'audio/wav' in content_type:
-            ext = '.wav'
-        elif 'audio/mpeg' in content_type or 'audio/mp3' in content_type:
-            ext = '.mp3'
-        elif 'audio/flac' in content_type:
-            ext = '.flac'
-        else:
-            ext = '.wav'  # Default to WAV
-        
-        audio_path = os.path.join(temp_dir, f"input{ext}")
-        
-        with open(audio_path, 'wb') as f:
-            for chunk in response.iter_content(chunk_size=8192):
-                f.write(chunk)
-        
-        logger.info(f"Downloaded audio to {audio_path}")
-        return audio_path
-        
-    except Exception as e:
-        logger.error(f"Failed to download audio: {e}")
-        raise
+        if response.status_code != 200:
+            raise RuntimeError("Unexpected source response")
+        size = 0
+        with path.open("wb") as target:
+            for chunk in response.iter_content(65536):
+                size += len(chunk)
+                if size > settings.audio_max_input_bytes:
+                    raise ValueError("Input exceeds processing limit")
+                target.write(chunk)
+    if size == 0:
+        raise ValueError("Input is empty")
 
 
-def load_demucs_model(model_name: str):
-    """Load Demucs model."""
-    try:
-        # Check if CUDA is available
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        logger.info(f"Using device: {device}")
-        
-        # Load the model
-        model = pretrained.get_model(model_name)
-        model.to(device)
-        
-        logger.info(f"Loaded Demucs model: {model_name}")
-        return model
-        
-    except Exception as e:
-        logger.error(f"Failed to load Demucs model {model_name}: {e}")
-        raise
-
-
-def separate_audio(model, audio_path: str, temp_dir: str) -> List[str]:
-    """Separate audio into stems using Demucs."""
-    try:
-        # Use Demucs separate function
-        # This will create separated files in the temp directory
-        separate.apply_model(
-            model, 
-            audio_path, 
-            out=temp_dir,
-            device=next(model.parameters()).device
-        )
-        
-        # Find the generated stem files
-        stem_files = []
-        stem_names = ["drums", "bass", "other", "vocals"]
-        
-        # Demucs creates a subdirectory with the model name
-        model_name = model.name if hasattr(model, 'name') else 'htdemucs'
-        output_dir = os.path.join(temp_dir, model_name)
-        
-        if os.path.exists(output_dir):
-            for stem_name in stem_names:
-                stem_path = os.path.join(output_dir, f"{stem_name}.wav")
-                if os.path.exists(stem_path):
-                    stem_files.append(stem_path)
-                    logger.info(f"Generated stem: {stem_name}")
-        
-        return stem_files
-        
-    except Exception as e:
-        logger.error(f"Failed to separate audio: {e}")
-        raise
-
-
-def upload_stems(stem_files: List[str], version_id: str) -> List[StemInfo]:
-    """Upload stem files to S3 and return stem information."""
-    stem_infos = []
-    
-    for stem_path in stem_files:
-        try:
-            stem_name = Path(stem_path).stem
-            stem_type = stem_name
-            
-            # Calculate file checksum
-            with open(stem_path, 'rb') as f:
-                file_hash = hashlib.sha256(f.read()).hexdigest()
-            
-            # Get file size
-            file_size = os.path.getsize(stem_path)
-            
-            # Get audio duration using ffprobe
-            duration = get_audio_duration(stem_path)
-            
-            # Upload to S3
-            s3_url = upload_to_s3(stem_path, f"{version_id}/{stem_name}.wav")
-            
-            # Create stem info
-            stem_info = StemInfo(
-                type=stem_type,
-                name=stem_name.title(),
-                url=s3_url,
-                size=file_size,
-                duration=duration,
-                checksum=f"sha256:{file_hash}"
-            )
-            
-            stem_infos.append(stem_info)
-            logger.info(f"Uploaded stem {stem_name} to {s3_url}")
-            
-        except Exception as e:
-            logger.error(f"Failed to upload stem {stem_path}: {e}")
-            raise
-    
-    return stem_infos
-
-
-def get_audio_duration(audio_path: str) -> float:
-    """Get audio duration using ffprobe."""
-    try:
-        cmd = [
-            "ffprobe",
-            "-v", "quiet",
-            "-show_entries", "format=duration",
-            "-of", "csv=p=0",
-            audio_path
+def runtime_environment() -> dict:
+    for binary in (settings.ffmpeg_path, settings.ffprobe_path):
+        if not Path(binary).is_file() or not os.access(binary, os.X_OK):
+            raise ValueError("Configure managed FFmpeg and FFprobe binaries")
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith(("CLERK_", "S3_", "STRIPE_", "DEMUCSSVC_"))
+        and key not in ("REDIS_URL", "DATABASE_URL")
+    }
+    environment["PATH"] = os.pathsep.join(
+        [
+            str(Path(settings.ffmpeg_path).parent),
+            str(Path(settings.ffprobe_path).parent),
+            environment.get("PATH", ""),
         ]
-        
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-        if result.returncode == 0:
-            return float(result.stdout.strip())
-        else:
-            logger.warning(f"ffprobe failed for {audio_path}, using default duration")
-            return 0.0
-            
-    except Exception as e:
-        logger.warning(f"Failed to get duration for {audio_path}: {e}")
-        return 0.0
+    )
+    environment["OMP_NUM_THREADS"] = str(settings.audio_worker_threads)
+    environment["MKL_NUM_THREADS"] = str(settings.audio_worker_threads)
+    return environment
 
 
-def send_webhook(webhook_url: str, payload: WebhookPayload):
-    """Send webhook with HMAC signature."""
+def infer_stems(
+    request: SplitRequest, input_path: Path, directory: Path, canceled: threading.Event
+):
+    # Executed in a killable subprocess; htdemucs is allowlisted, never an arbitrary model/path.
+    if request.model != "htdemucs":
+        raise ValueError("Unsupported inference model")
+    command = [
+        sys.executable,
+        "-m",
+        "src.inference",
+        str(os.getpid()),
+        "-n",
+        "htdemucs",
+        "-d",
+        settings.audio_device,
+        "--shifts",
+        "0",
+        "--segment",
+        "6",
+        "--overlap",
+        "0.1",
+        "-j",
+        "1",
+        "-o",
+        str(directory / "separated"),
+        str(input_path),
+    ]
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        env=runtime_environment(),
+        start_new_session=True,
+    )
     try:
-        payload_json = payload.model_dump_json()
-        headers = get_webhook_headers(payload_json)
-        
-        response = requests.post(
-            webhook_url,
-            data=payload_json,
-            headers=headers,
-            timeout=30
-        )
-        response.raise_for_status()
-        
-        logger.info(f"Successfully sent webhook to {webhook_url}")
-        
-    except Exception as e:
-        logger.error(f"Failed to send webhook to {webhook_url}: {e}")
+        state.patch(str(request.jobId), inferencePid=process.pid)
+    except Exception:
+        os.killpg(process.pid, signal.SIGKILL)
+        process.communicate(timeout=10)
         raise
+    deadline = time.monotonic() + settings.audio_job_timeout_seconds
+    try:
+        while process.poll() is None:
+            if canceled.is_set() or time.monotonic() > deadline:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.communicate(timeout=10)
+                if canceled.is_set():
+                    raise JobCanceled()
+                raise TimeoutError("Inference exceeded time budget")
+            time.sleep(0.25)
+        process.communicate(timeout=10)
+        if process.returncode:
+            raise RuntimeError("Demucs inference failed")
+    finally:
+        if process.poll() is None:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.communicate(timeout=10)
+    return {
+        output.type: directory
+        / "separated"
+        / "htdemucs"
+        / input_path.stem
+        / (output.type + ".wav")
+        for output in request.outputs
+    }
+
+
+@celery_app.task(bind=True, name="audio.process", max_retries=3)
+def process_audio_split(self, job_id: str):
+    current = state.load(job_id)
+    if not current or current.get("status") in ("completed", "failed", "canceled"):
+        return
+    if current.get("status") == "callback_pending":
+        deliver_callback.apply_async(args=[job_id])
+        return
+    db = state.client()
+    lease = db.lock(
+        settings.audio_redis_prefix + "inference-lease:" + job_id,
+        timeout=90,
+        blocking=False,
+        thread_local=False,
+    )
+    if not lease.acquire(blocking=False):
+        return
+    started = time.monotonic()
+    canceled = threading.Event()
+    stop = threading.Event()
+    thread = None
+    request = SplitRequest.model_validate(current["request"])
+    try:
+        attempts = int(current.get("inferenceAttempts", 0)) + 1
+        if attempts > 3:
+            raise RuntimeError("Inference retry budget exhausted")
+        state.patch(
+            job_id, status="processing", inferenceAttempts=attempts, stage="downloading"
+        )
+        initial = refresh(request)
+
+        def heartbeat():
+            failures = 0
+            while not stop.wait(20):
+                try:
+                    lease.extend(90, replace_ttl=True)
+                    fresh = refresh(request)
+                    state.patch(job_id, grants=fresh)
+                    failures = 0
+                except JobCanceled:
+                    canceled.set()
+                    return
+                except Exception:
+                    failures += 1
+                    if failures >= 3:
+                        canceled.set()
+                        return
+
+        thread = threading.Thread(target=heartbeat, daemon=True)
+        thread.start()
+        with tempfile.TemporaryDirectory(prefix="track-tree-demucs-") as temporary:
+            directory = Path(temporary)
+            source = directory / "input.audio"
+            download_audio(initial["audioUrl"], source)
+            state.patch(job_id, stage="inference")
+            paths = infer_stems(request, source, directory, canceled)
+            if canceled.is_set():
+                raise JobCanceled()
+            # Renew destination grants after inference, so queue/model/download delay cannot expire PUTs.
+            grants = refresh(request)
+            output_grants = {output["type"]: output for output in grants["outputs"]}
+            results = []
+            total = 0
+            for output in request.outputs:
+                path = paths[output.type]
+                if not path.is_file():
+                    raise ValueError("Expected model output is missing")
+                size = path.stat().st_size
+                total += size
+                if total > settings.audio_max_output_bytes:
+                    raise ValueError("Outputs exceed processing limit")
+                with wave.open(str(path), "rb") as audio:
+                    duration_ms = round(
+                        audio.getnframes() / audio.getframerate() * 1000
+                    )
+                checksum = hashlib.sha256(path.read_bytes()).hexdigest()
+                if canceled.is_set():
+                    raise JobCanceled()
+                with path.open("rb") as data:
+                    response = requests.put(
+                        output_grants[output.type]["uploadUrl"],
+                        data=data,
+                        headers={"Content-Type": "audio/wav"},
+                        timeout=(5, 120),
+                        allow_redirects=False,
+                    )
+                    response.raise_for_status()
+                results.append(
+                    {
+                        "type": output.type,
+                        "fileKey": output.fileKey,
+                        "sizeBytes": size,
+                        "durationMs": duration_ms,
+                        "checksumSha256": checksum,
+                    }
+                )
+            payload = {
+                "jobId": str(request.jobId),
+                "versionId": str(request.versionId),
+                "status": "completed",
+                "stems": results,
+                "processingTimeMs": round((time.monotonic() - started) * 1000),
+            }
+    except JobCanceled:
+        state.patch(job_id, status="canceled", stage="canceled")
+        return
+    except Exception:
+        # No URLs, secrets, provider errors or local paths in browser-visible failures.
+        payload = {
+            "jobId": str(request.jobId),
+            "versionId": str(request.versionId),
+            "status": "failed",
+            "stems": [],
+            "processingTimeMs": round((time.monotonic() - started) * 1000),
+            "error": "Audio processing failed; check the worker configuration and retry the job",
+        }
+    finally:
+        stop.set()
+        if thread:
+            thread.join(timeout=20)
+        try:
+            lease.release()
+        except Exception:
+            pass
+    WebhookPayload.model_validate(payload)
+    # Persist before enqueue. Callback redelivery never re-enters inference.
+    state.patch(job_id, status="callback_pending", callback=payload, stage="delivering")
+    deliver_callback.apply_async(args=[job_id], task_id="callback:" + job_id)
+
+
+@celery_app.task(bind=True, name="audio.callback", max_retries=12)
+def deliver_callback(self, job_id: str):
+    current = state.load(job_id)
+    if not current or current.get("status") != "callback_pending":
+        return
+    payload = current["callback"]
+    request = SplitRequest.model_validate(current["request"])
+    if not is_webhook_url_allowed(request.callbackUrl):
+        raise ValueError("Callback destination is not approved")
+    raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    try:
+        response = requests.post(
+            request.callbackUrl,
+            data=raw,
+            headers=get_webhook_headers(raw),
+            timeout=60,
+            allow_redirects=False,
+        )
+        if response.status_code in (404, 409):
+            state.patch(job_id, status="canceled", stage="canceled")
+            return
+        response.raise_for_status()
+        if response.status_code != 200:
+            raise RuntimeError("Unexpected callback response")
+    except Exception as error:
+        attempts = int(current.get("callbackAttempts", 0)) + 1
+        state.patch(job_id, callbackAttempts=attempts)
+        if attempts >= 12:
+            state.patch(job_id, status="failed", stage="callback_failed")
+            return
+        raise self.retry(
+            exc=RuntimeError("Callback delivery failed"),
+            countdown=min(300, 2 ** min(attempts, 8)),
+        ) from error
+    state.patch(job_id, status=payload["status"], stage="done")
+
+
+@celery_app.task(name="audio.recover")
+def recover_audio_jobs():
+    db = state.client()
+    count = 0
+    for key in db.scan_iter(settings.audio_redis_prefix + "job:*", count=100):
+        current = json.loads(db.get(key) or "{}")
+        job_id = current.get("request", {}).get("jobId")
+        if not job_id:
+            continue
+        if current.get("status") == "callback_pending":
+            deliver_callback.apply_async(args=[job_id])
+            count += 1
+        elif current.get("status") in ("queued", "processing") and not db.exists(
+            settings.audio_redis_prefix + "inference-lease:" + job_id
+        ):
+            process_audio_split.apply_async(
+                args=[job_id], task_id="inference:" + job_id
+            )
+            count += 1
+        if count >= 100:
+            break
+    return {"recovered": count}

@@ -1,3 +1,5 @@
+> Implementation update (2026-10-20): this file retains historical project context. Current architecture, commands, ownership and verification are in [workspace AGENTS.md](../AGENTS.md), [E2E strategy](../E2E_STRATEGY.md), and [coordination](../docs/e2e/COORDINATION.md). Prefer those sources when older examples conflict.
+
 0) TL;DR Mission
 
 GPU microservice that runs Demucs to split stems. Pulls audio from a pre-signed URL, uploads stems to S3/R2, then POSTs a signed webhook to track-tree-api. No DB. No app secrets outside the HMAC token.

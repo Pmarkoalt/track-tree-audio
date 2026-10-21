@@ -1,52 +1,30 @@
-# Use NVIDIA CUDA base image for GPU support
-FROM nvidia/cuda:11.8-devel-ubuntu22.04
-
-# Set environment variables
-ENV DEBIAN_FRONTEND=noninteractive
-ENV PYTHONUNBUFFERED=1
-ENV CUDA_VISIBLE_DEVICES=0
-
-# Install system dependencies
-RUN apt-get update && apt-get install -y \
-    python3.11 \
-    python3.11-dev \
-    python3-pip \
-    ffmpeg \
-    git \
-    curl \
-    && rm -rf /var/lib/apt/lists/*
-
-# Create symbolic link for python
-RUN ln -s /usr/bin/python3.11 /usr/bin/python
-
-# Set working directory
+# Core HTTP/runtime image. GPU inference requires the explicitly selected gpu target.
+FROM python:3.11.13-slim-bookworm AS core
+ENV PYTHONUNBUFFERED=1 UV_PROJECT_ENVIRONMENT=/opt/venv
 WORKDIR /app
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg curl libsndfile1 \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=ghcr.io/astral-sh/uv:0.10.0 /uv /usr/local/bin/uv
+COPY pyproject.toml uv.lock ./
+RUN uv sync --frozen --no-dev
+COPY src ./src
+RUN useradd --create-home --uid 1000 appuser && chown -R appuser /app /opt/venv
+USER appuser
+EXPOSE 8080
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD curl --fail --silent http://localhost:8080/healthz || exit 1
+CMD ["/opt/venv/bin/uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "8080"]
 
-# Copy requirements first for better caching
-COPY requirements.txt .
-
-# Install Python dependencies
-RUN pip install --no-cache-dir -r requirements.txt
-
-# Install PyTorch with CUDA support
-RUN pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu118
-
-# Install Demucs
-RUN pip install demucs
-
-# Copy application code
-COPY src/ ./src/
-
-# Create non-root user
-RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app
+# Native CPU deployment uses official CPU wheels rather than CUDA runtime payloads.
+FROM core AS cpu
+USER root
+RUN uv sync --frozen --no-dev --extra cpu && chown -R appuser /opt/venv
 USER appuser
 
-# Expose port
-EXPOSE 8080
+FROM core AS gpu
+USER root
+RUN uv sync --frozen --no-dev --extra gpu && chown -R appuser /opt/venv
+USER appuser
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:8080/healthz || exit 1
-
-# Default command
-CMD ["uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "8080"]
+# The default image stays lightweight; select --target gpu for inference.
+FROM core AS runtime
