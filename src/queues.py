@@ -6,7 +6,7 @@ from .env import settings
 celery_app = Celery(
     "track_tree_audio",
     broker=settings.redis_url,
-    include=["src.demucs_runner"],
+    include=["src.demucs_runner", "src.rendition_service"],
 )
 celery_app.conf.update(
     task_serializer="json",
@@ -41,8 +41,12 @@ celery_app.conf.update(
         "audio.process": {"queue": settings.audio_redis_prefix + "inference"},
         "audio.callback": {"queue": settings.audio_redis_prefix + "callbacks"},
         "audio.recover": {"queue": settings.audio_redis_prefix + "callbacks"},
+        "rendition.execute": {"queue": settings.audio_redis_prefix + "rendition-execution"},
+        "rendition.callback": {"queue": settings.audio_redis_prefix + "rendition-callbacks"},
+        "rendition.recover": {"queue": settings.audio_redis_prefix + "rendition-callbacks"},
     },
     beat_schedule={
-        "recover-persisted-jobs": {"task": "audio.recover", "schedule": 30.0}
+        "recover-persisted-jobs": {"task": "audio.recover", "schedule": 30.0},
+        "recover-rendition-jobs": {"task": "rendition.recover", "schedule": 10.0},
     },
 )

@@ -136,3 +136,63 @@ async def split_audio(request: Request):
     except Exception:
         raise HTTPException(503, "Queue is unavailable; retry the same job ID")
     return SplitResponse(jobId=payload.jobId)
+
+
+def _rendition_problem(code: str, status: int) -> JSONResponse:
+    return JSONResponse(
+        {
+            "type": "about:blank",
+            "title": "Rendition request failed",
+            "status": status,
+            "detail": "Rendition request could not be completed",
+            "requestId": str(uuid4()),
+            "code": code,
+        },
+        status_code=status,
+        media_type="application/problem+json",
+    )
+
+
+async def _rendition_request(request: Request, path_job_id: str | None = None):
+    # Count actual streamed bytes before parsing or signing, including requests
+    # without a Content-Length header. Never return parser/provider diagnostics.
+    chunks = []
+    size = 0
+    async for chunk in request.stream():
+        size += len(chunk)
+        if size > 65536:
+            return _rendition_problem("RENDITION_BODY_TOO_LARGE", 413)
+        chunks.append(chunk)
+    from .rendition_jobs import accept_rendition, cancel_rendition, RenditionJobError
+    from .rendition_service import rendition_runtime
+
+    body = b"".join(chunks)
+    signature = request.headers.get("X-Signature", "")
+    timestamp = request.headers.get("X-Timestamp", "")
+    try:
+        if path_job_id is None:
+            result = accept_rendition(
+                body, signature, timestamp,
+                runtime=rendition_runtime(), enabled=settings.renditions_enabled,
+            )
+            return JSONResponse(result, status_code=202)
+        result = cancel_rendition(
+            body, signature, timestamp,
+            path_job_id=path_job_id, runtime=rendition_runtime(),
+        )
+        return JSONResponse(result, status_code=200)
+    except RenditionJobError as error:
+        return _rendition_problem(error.code, error.status_code)
+    except Exception:
+        return _rendition_problem("RENDITION_SERVICE_UNAVAILABLE", 503)
+
+
+@app.post("/renditions", status_code=202)
+async def submit_rendition(request: Request):
+    return await _rendition_request(request)
+
+
+@app.post("/renditions/{job_id}/cancel")
+async def cancel_rendition_execution(job_id: str, request: Request):
+    # Cancellation/cleanup remains available when optional admissions are off.
+    return await _rendition_request(request, job_id)

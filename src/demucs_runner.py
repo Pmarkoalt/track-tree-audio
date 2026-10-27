@@ -4,8 +4,6 @@ import hashlib
 import json
 import os
 from pathlib import Path
-import signal
-import subprocess
 import sys
 import tempfile
 import threading
@@ -17,6 +15,7 @@ from .env import settings
 from .models import SplitRequest, WebhookPayload
 from .security import get_webhook_headers, is_media_url_allowed, is_webhook_url_allowed
 from .queues import celery_app
+from .process_runtime import ProcessCanceled, run_supervised
 from . import state
 
 
@@ -137,36 +136,18 @@ def infer_stems(
         str(directory / "separated"),
         str(input_path),
     ]
-    process = subprocess.Popen(
-        command,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        env=runtime_environment(),
-        start_new_session=True,
-    )
     try:
-        state.patch(str(request.jobId), inferencePid=process.pid)
-    except Exception:
-        os.killpg(process.pid, signal.SIGKILL)
-        process.communicate(timeout=10)
-        raise
-    deadline = time.monotonic() + settings.audio_job_timeout_seconds
-    try:
-        while process.poll() is None:
-            if canceled.is_set() or time.monotonic() > deadline:
-                os.killpg(process.pid, signal.SIGKILL)
-                process.communicate(timeout=10)
-                if canceled.is_set():
-                    raise JobCanceled()
-                raise TimeoutError("Inference exceeded time budget")
-            time.sleep(0.25)
-        process.communicate(timeout=10)
-        if process.returncode:
-            raise RuntimeError("Demucs inference failed")
-    finally:
-        if process.poll() is None:
-            os.killpg(process.pid, signal.SIGKILL)
-            process.communicate(timeout=10)
+        run_supervised(
+            command,
+            environment=runtime_environment(),
+            canceled=canceled,
+            timeout_seconds=settings.audio_job_timeout_seconds,
+            on_started=lambda pid: state.patch(str(request.jobId), inferencePid=pid),
+            failed_message="Demucs inference failed",
+            timeout_message="Inference exceeded time budget",
+        )
+    except ProcessCanceled:
+        raise JobCanceled() from None
     return {
         output.type: directory
         / "separated"

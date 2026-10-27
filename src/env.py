@@ -22,6 +22,9 @@ class Settings(BaseSettings):
     audio_job_timeout_seconds: int = 1500
     audio_worker_threads: int = 2
     audio_job_retention_seconds: int = 7 * 86400
+    renditions_enabled: bool = False
+    rendition_api_base_url: str = ""
+    rendition_work_root: str = ""
 
 
 settings = Settings()

@@ -54,6 +54,30 @@ Change both worker queue names when changing `AUDIO_REDIS_PREFIX`. The enclosing
 workspace's `scripts/audio-local.ts` launcher manages these processes and private
 logs for isolated local verification.
 
+The optional RND-1 FLAC pilot defaults to `RENDITIONS_ENABLED=false`. Its signed
+HTTP routes are `/renditions` and `/renditions/{jobId}/cancel`. Configure
+`RENDITION_API_BASE_URL` to the trusted API base before admitting work; only the
+fixed rendition callback/refresh/heartbeat paths are constructed from it.
+Cancellation and delivery cleanup remain available while admissions are disabled.
+`RENDITION_WORK_ROOT`, when supplied, must be an absolute private scratch path.
+The default scratch root is isolated by the configured Redis namespace.
+
+For a separately qualified pilot, run execution and delivery as separate core
+workers so codec work cannot block callback retry. Change the prefixes below to
+match `AUDIO_REDIS_PREFIX`; keep the existing inference worker/environment separate.
+
+```sh
+uv run --frozen celery -A src.queues worker --pool=solo --concurrency=1 --queues track-tree-audio:rendition-execution --hostname rendition-execution@%h --loglevel=info
+uv run --frozen celery -A src.queues worker --pool=solo --concurrency=1 --queues track-tree-audio:rendition-callbacks --hostname rendition-callbacks@%h --loglevel=info
+```
+
+Use one supervised recovery scheduler. Rendition recovery runs every10 seconds
+with at most25 jobs per sweep. Redis token fencing enforces one rendition execution
+across worker processes; broker redelivery never authorizes another encode attempt.
+The bundled schema is an exact pinned distribution copy of the frozen contracts
+artifact. Update it only with a new canonical release and matching consumer tests.
+These commands do not establish API/storage/callback or deployment qualification.
+
 ## Protocol and security
 
 Canonical request/response/callback definitions and exact-byte fixtures live in

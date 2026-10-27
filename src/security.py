@@ -5,6 +5,7 @@ import hmac
 import re
 import time
 from urllib.parse import urlsplit
+from uuid import UUID
 from .env import settings
 
 
@@ -73,3 +74,47 @@ def is_media_url_allowed(url: str) -> bool:
         and not value.fragment
         and f"{value.scheme}://{value.netloc}" in settings.media_url_origins
     )
+
+
+def rendition_control_url(job_id: str, purpose: str) -> str:
+    """Construct only fixed canonical control paths from operator configuration."""
+    base = settings.rendition_api_base_url
+    value = urlsplit(base)
+    if (
+        not base
+        or value.scheme not in ("http", "https")
+        or not value.hostname
+        or value.username is not None
+        or value.password is not None
+        or "?" in base
+        or "#" in base
+        or "\\" in base
+        or any(ord(char) <= 32 or ord(char) == 127 for char in base)
+        or any(segment in (".", "..") for segment in value.path.split("/"))
+    ):
+        raise ValueError("Rendition API destination is not configured")
+    # Match canonical EntityIdSchema's lowercase UUID transform after raw-byte
+    # authentication. Datetime strings are handled separately without rewriting.
+    try:
+        identifier = str(UUID(job_id))
+    except (ValueError, TypeError, AttributeError):
+        raise ValueError("Invalid rendition job ID") from None
+    if identifier != job_id.lower():
+        raise ValueError("Invalid rendition job ID")
+    job_id = identifier
+    if purpose == "callback":
+        path = "/webhooks/renditions"
+    elif purpose in ("refresh", "heartbeat"):
+        path = f"/internal/renditions/jobs/{job_id}/" + (
+            "urls" if purpose == "refresh" else "heartbeat"
+        )
+    else:
+        raise ValueError("Invalid rendition control purpose")
+    return base.rstrip("/") + path
+
+
+def is_rendition_control_url_allowed(url: str, job_id: str, purpose: str) -> bool:
+    try:
+        return url == rendition_control_url(job_id, purpose)
+    except ValueError:
+        return False
